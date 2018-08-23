@@ -1,0 +1,7 @@
+{
+    "board": "arduino:avr:nano",
+    "port": "COM4",
+    "output": "../build",
+    "sketch": "Navigator.ino",
+    "configuration": "cpu=atmega328"
+}
