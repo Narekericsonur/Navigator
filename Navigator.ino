@@ -1,5 +1,5 @@
 /*
-  This is the code for the Navigator module on a GPS/IMU guided airplane
+  This is the code for the Navigator module on a GPS/Accelerometer guided airplane
   Narek Boghozian
 
   Notes:
@@ -7,6 +7,9 @@
       32bit Lat, 32bit Lng, 16bit Alt
       4byte Lat, 4byte Lng, 2byte Alt
 
+  To-Do:
+    Log everything to SD card. Use last data address on eeprom to keep track of which file we're on
+    When testing, adjust all the constants and PID function to perfect flight
 
 
 */
@@ -17,14 +20,15 @@
 int CS_PIN = 10;
 File file;
 
-// ------------------------------------------ IMU
+// ------------------------------------------ Accelerometer
 #include <Wire.h>
 const int MPU = 0x68;
-int16_t imuData[7]; //int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
+int16_t accData[3]; //
 
 // ------------------------------------------ GPS
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
+const int16_t targetSize = 10; // how close to waypoint is close enough
 static const int RXPin = 4, TXPin = 3;
 static const uint32_t GPSBaud = 9600;
 TinyGPSPlus gps;
@@ -52,11 +56,19 @@ double latD, lngD;
 float alt;
 Coord currentLocation, previousLocation;
 int16_t currentCourse = 0;
+Waypoint allWaypoints;
+Orientation currentOrientation, desiredOrientation;
+uint16_t distanceToWp;
 
 // ------------------------------------------ General stuff
 int8_t pos[4];
 const byte Pilot = 4;
 #include <EEPROM.h>
+int16_t kP[4], kI[4], kD[4];
+float currentSpeed = 100; // 10 m/s ideal (probably)
+
+
+
 
 void setup()
 {
@@ -71,16 +83,29 @@ void setup()
   pos[2] = 0;
   pos[3] = 0; // from -100 to 100 for easy division
 
+  kP[0] = 10;
+  kP[1] = 10;
+  kP[2] = 10;
+  kP[3] = 10;
+
+  kI[0] = 10;
+  kI[1] = 10;
+  kI[2] = 10;
+  kI[3] = 10;
+
+  kD[0] = 10;
+  kD[1] = 10;
+  kD[2] = 10;
+  kD[3] = 10;
+
   // ----------------------------------- SD
   pinMode(CS_PIN, OUTPUT);
   SD.begin();
 
-  // ----------------------------------- IMU
-  Wire.begin();
-  Wire.beginTransmission(MPU);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission(true);
+  // ----------------------------------- Accelerometer
+  pinMode(A0, INPUT);
+  pinMode(A1, INPUT);
+  pinMode(A2, INPUT);
 }
 
 void loop()
@@ -102,14 +127,17 @@ void loop()
     currentLocation.lng = lngD * 1000000;
     currentLocation.alt = alt;
     currentCourse = gps.course.deg();
+    currentSpeed = gps.speed.meters();
     //Serial.println("");
-    Serial.print(gps.location.lat(), 8);
-    Serial.print(", ");
-    Serial.println(gps.location.lng(), 8);
+    // Serial.print(gps.location.lat(), 8);
+    // Serial.print(", ");
+    // Serial.println(gps.location.lng(), 8);
   }
-  calculateTrajectory();
-  readIMU(imuData);
-  orientationChange();
+  calculateTrajectory(currentLocation, allWaypoints.nextWaypoint, 
+  previousLocation, &currentOrientation, &desiredOrientation, &distanceToWp);
+  readAcc(accData);
+  PID();
+  logALL();
 
   //Calculate desired trajectory
   //  - how far until next waypoint
@@ -122,42 +150,22 @@ void loop()
   //Send order for action
 }
 
-void readIMU(int16_t *imuData)
+void readAcc(int16_t *accData)
 {
-  for (int i = 0; i < 5; i++)
-  {
-    imuData[i] = 0;
-  }
-
-  for (int i = 0; i < 5; i++)
-  {
-    Wire.beginTransmission(MPU);
-    Wire.write(0x3B);
-    Wire.endTransmission(false);
-    Wire.requestFrom(MPU, 14, true);
-    imuData[0] += Wire.read() << 8 | Wire.read();
-    imuData[1] += Wire.read() << 8 | Wire.read();
-    imuData[2] += Wire.read() << 8 | Wire.read();
-    imuData[3] += Wire.read() << 8 | Wire.read();
-    imuData[4] += Wire.read() << 8 | Wire.read();
-    imuData[5] += Wire.read() << 8 | Wire.read();
-    imuData[6] += Wire.read() << 8 | Wire.read();
-  }
-  for (int i = 0; i < 5; i++)
-  {
-    imuData[i] /= 5;
-  }
+  accData[0] = analogRead(A0);
+  accData[1] = analogRead(A1);
+  accData[2] = analogRead(A2);
 }
 
-void logIMU(int16_t *imuData)
+void logAcc(int16_t *accData)
 {
   file = SD.open("Data.txt", FILE_WRITE);
-  for (int i = 0; i < 6; i++)
+  for (int i = 0; i < 2; i++)
   {
-    file.print(String(imuData[i]));
+    file.print(String(accData[i]));
     file.print(",");
   }
-  file.println(String(imuData[6]));
+  file.println(String(accData[3]));
   file.close();
 }
 
@@ -226,26 +234,60 @@ void Waypoint::extractWaypoints()
 void Waypoint::goToNext()
 {
   EEPROM.get(currentwaypointnumber_ * sizeof(nextWaypoint), nextWaypoint);
+  currentwaypointnumber_++;
 }
 
 // from a to b where a = currentLocation and b = nextWaypoint and prevLoc = previousLocation
-void calculateTrajectory(Coord a, Coord b, Coord prevLoc, Orientation *currentOrientation, Orientation *desiredOrientation, uint16_t *distanceToWp)
+void calculateTrajectory(Coord a, Coord b, Coord prevLoc, 
+Orientation *cOrientation, Orientation *dOrientation, uint16_t *dToWp)
 {
+  if (distanceTo(a, b) < targetSize)
+  {
+    allWaypoints.goToNext();
+    b = allWaypoints.nextWaypoint;
+  }
   // phi calculations
   double_t aLat, aLng, bLat, bLng;
-  int16_t deg = 0;
-  deg = arctan(a.Lat, a.Lng, b.Lat, b.Lng);
-  &desiredOrientation->phi = deg;
-  &currentOrientation->phi = gps.course.value();
+  int16_t deg = 0, dAlt = 0; // d = delta
+  &desiredOrientation->phi = arctan(a.Lat, a.Lng, b.Lat, b.Lng); // Desired Bearing
+  &currentOrientation->phi = gps.course.value(); // Current Bearing
 
   // Theta calculations
+  //Current
+  dAlt = a.alt - prevloc.alt;
+  //Desired
 
-  //
 }
 
-void orientationChange(Orientation currentOrientation, Orientation desiredOrientation, int16_t *imuDataArray, int8_t *posArray)
+// determines the 4 pos values to modify control surfaces.
+// must take into consideration - orientation we wanna be at (sometimes straight, sometimes angled)
+//                                vs what we're at
+// 
+void PID(Orientation currentOrientation, Orientation desiredOrientation, float currentSpeed,
+int16_t *accDataArray, int8_t *posArray, int16_t kPro, int16_t kInt, int16_t kDer)
 {
   // PID
+  // posArray = [throttle, elevator, rudder, aileron]
+  // for now, ignore aileron
+  // for now just use pid for altitude and bearing. Experiment with throttle and make it proportional
+  
+  // throttle (ideal is ~50% power, but 10m/s will be attempted)
+  posArray[0] = -5*currentSpeed + 100;
+  if (posArray[0] > 100)
+  posArray[0] = 100;
+  else if(posArray[0] < 100)
+  posArray[0] = 0;
+
+  // elevator
+  posArray[1] = 
+
+  // rudder
+
+
+
+  // aileron (at some point, probably to do with stability of aircraft)
+
+
 }
 
 // Very innacurate but will do the job.
@@ -303,4 +345,9 @@ int16_t arctan(int16_t latA, int16_t lonA, int16_t latB, int16_t lonB)
   }
 
   return deg;
+}
+
+int16_t distanceTo(Coord a, Coord b) // Horizontal distance to other coordinate
+{
+  return sqrt((a.lat - b.lat) ^ 2 + (a.lng - b.lng) ^ 2);
 }
