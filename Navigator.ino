@@ -233,13 +233,8 @@ void calculateTrajectory(Coord a, Coord b, Coord prevLoc, Orientation *currentOr
 {
   // phi calculations
   double_t aLat, aLng, bLat, bLng;
-  int16_t deg;
-  deg = 0;
-  aLat = a.lat / 1000000;
-  aLng = a.lng / 1000000;
-  bLat = b.lat / 1000000;
-  bLng = b.lng / 1000000;
-  deg = gps.courseTo(aLat, aLng, bLat, bLng);
+  int16_t deg = 0;
+  deg = arctan(a.Lat, a.Lng, b.Lat, b.Lng);
   &desiredOrientation->phi = deg;
   &currentOrientation->phi = gps.course.value();
 
@@ -254,7 +249,7 @@ void orientationChange(Orientation currentOrientation, Orientation desiredOrient
 }
 
 // Very innacurate but will do the job.
-uint16_t arctan(int16_t latA, int16_t lonA, int16_t latB, int16_t lonB)
+int16_t arctan(int16_t latA, int16_t lonA, int16_t latB, int16_t lonB)
 {
 
   int16_t x, deg;
@@ -306,4 +301,6 @@ uint16_t arctan(int16_t latA, int16_t lonA, int16_t latB, int16_t lonB)
       deg += 180;
     }
   }
+
+  return deg;
 }
